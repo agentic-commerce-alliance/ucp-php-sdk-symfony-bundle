@@ -6,7 +6,6 @@ namespace Ucp\Sdk\Symfony\Operation;
 
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
-use Ucp\Sdk\Contract\Ap2CheckoutMandateVerifierInterface;
 use Ucp\Sdk\Contract\CapabilityInterface;
 use Ucp\Sdk\Contract\CartCapabilityInterface;
 use Ucp\Sdk\Contract\CatalogCapabilityInterface;
@@ -15,6 +14,7 @@ use Ucp\Sdk\Contract\CheckoutRequestValidatorInterface;
 use Ucp\Sdk\Contract\CheckoutResponseAugmenterInterface;
 use Ucp\Sdk\Contract\DiscountCapabilityInterface;
 use Ucp\Sdk\Contract\OrderCapabilityInterface;
+use Ucp\Sdk\Contract\PaymentAwareCheckoutCapabilityInterface;
 use Ucp\Sdk\Contract\PaymentMandateVerifierInterface;
 use Ucp\Sdk\Enum\UcpCapability;
 use Ucp\Sdk\Enum\UcpProtocolVersion;
@@ -22,7 +22,6 @@ use Ucp\Sdk\Enum\UcpResponseStatus;
 use Ucp\Sdk\Event\CheckoutRequestReceivedEvent;
 use Ucp\Sdk\Event\CheckoutResponsePreparedEvent;
 use Ucp\Sdk\Event\PaymentMandateVerificationEvent;
-use Ucp\Sdk\Exception\Ap2Exception;
 use Ucp\Sdk\Exception\NegotiationException;
 use Ucp\Sdk\Exception\UnsupportedCapabilityException;
 use Ucp\Sdk\Model\Catalog\CatalogLookupResponse;
@@ -34,7 +33,6 @@ use Ucp\Sdk\Model\Protocol\UcpOperationPayload;
 use Ucp\Sdk\Model\Protocol\UcpOperationResponse;
 use Ucp\Sdk\Model\RequestContext;
 use Ucp\Sdk\Service\CapabilityRegistryInterface;
-use Ucp\Sdk\Service\CheckoutMerchantAuthorizationSignerInterface;
 use Ucp\Sdk\Service\ProtocolValidatorInterface;
 use Ucp\Sdk\Symfony\Bridge\HttpPayloadMapper;
 
@@ -45,7 +43,6 @@ final class ShoppingOperationExecutor
      * @param iterable<CheckoutRequestValidatorInterface> $requestValidators
      * @param iterable<CheckoutResponseAugmenterInterface> $responseAugmenters
      * @param iterable<PaymentMandateVerifierInterface> $mandateVerifiers
-     * @param iterable<Ap2CheckoutMandateVerifierInterface> $ap2CheckoutMandateVerifiers
      */
     public function __construct(
         private readonly CapabilityRegistryInterface $capabilityRegistry,
@@ -55,8 +52,6 @@ final class ShoppingOperationExecutor
         private readonly iterable $responseAugmenters,
         private readonly iterable $mandateVerifiers,
         private readonly EventDispatcherInterface $eventDispatcher,
-        private readonly iterable $ap2CheckoutMandateVerifiers = [],
-        private readonly ?CheckoutMerchantAuthorizationSignerInterface $checkoutMerchantAuthorizationSigner = null,
     ) {
     }
 
@@ -162,11 +157,19 @@ final class ShoppingOperationExecutor
 
     private function cartUpdate(ShoppingOperationRequest $request): UcpOperationResponse
     {
-        $this->protocolValidator->validateRequest('cart.update', $request->payload, $request->context);
+        // cart.update.request requires `id`, but the id arrives out of band on a
+        // transport that puts it in the route (REST) or in a tool argument (MCP).
+        // Validating the bare payload made callers repeat it inside the body just to
+        // satisfy the schema, and toCartUpdateRequest() then discarded that copy.
+        // Merge it first, the way cart.get and cart.cancel already do. A payload that
+        // still carries `id` keeps working: the spread lets it win, and it is then
+        // ignored exactly as before.
+        $id = $this->requiredId($request);
+        $this->protocolValidator->validateRequest('cart.update', ['id' => $id, ...$request->payload], $request->context);
 
         return $this->response(
             'cart.update',
-            $this->cart($request->context)->updateCart($this->payloadMapper->toCartUpdateRequest($this->requiredId($request), $request->payload), $request->context),
+            $this->cart($request->context)->updateCart($this->payloadMapper->toCartUpdateRequest($id, $request->payload), $request->context),
             UcpCapability::Cart,
             $request->context,
         );
@@ -247,63 +250,31 @@ final class ShoppingOperationExecutor
     private function checkoutComplete(ShoppingOperationRequest $request): UcpOperationResponse
     {
         $this->protocolValidator->validateRequest('checkout.complete', $request->payload, $request->context);
-        $completeRequest = $this->payloadMapper->toCheckoutCompleteRequest($this->requiredId($request), $request->payload);
-        $checkoutCapability = $this->checkout($request->context);
-        $ap2Active = $this->ap2Negotiated($request->context);
+        $id = $this->requiredId($request);
+        $capability = $this->checkout($request->context);
+        $completeRequest = $this->payloadMapper->toCheckoutCompleteRequest($id, $request->payload);
 
-        // AP2 activates only through capability negotiation. An ap2 member on a session that
-        // never negotiated dev.ucp.shopping.ap2_mandate is a protocol violation, not an opt-in.
-        if (! $ap2Active && $completeRequest->ap2 !== null) {
-            throw new Ap2Exception('ap2_not_negotiated', 'The request carries an ap2 member, but the dev.ucp.shopping.ap2_mandate capability was not negotiated for this session.');
-        }
-
-        // When AP2 is negotiated the spec requires rejecting completions without a mandate.
-        if ($ap2Active && $completeRequest->ap2?->checkoutMandate === null) {
-            throw new Ap2Exception('mandate_required', 'AP2 is active for this checkout, but the request is missing ap2.checkout_mandate.');
-        }
-
-        if ($completeRequest->payment !== null) {
-            foreach ($completeRequest->payment->instruments as $instrument) {
-                foreach ($this->mandateVerifiers as $verifier) {
-                    $verifier->verify($instrument, $request->context);
-                }
-
-                $this->eventDispatcher->dispatch(new PaymentMandateVerificationEvent($instrument, $request->context));
-            }
-        }
-
-        // AP2 mandate verification runs only when AP2 is active and a mandate was supplied.
-        // Verifiers are a lazy tagged-service iterable, so the checkout is fetched inside the
-        // loop via `??=`: at most once, and not at all when there is nothing to verify.
-        // Reaching here with $ap2Active means the mandate_required guard above already
-        // confirmed a mandate is present.
-        $currentCheckout = null;
-        if ($ap2Active) {
-            $verified = false;
-            foreach ($this->ap2CheckoutMandateVerifiers as $verifier) {
-                $currentCheckout ??= $checkoutCapability->getCheckout($completeRequest->id, $request->context);
-                if (! $verifier->supports($completeRequest, $currentCheckout, $request->context)) {
-                    continue;
-                }
-
-                $verifier->verify($completeRequest, $currentCheckout, $request->context);
-                $verified = true;
+        // Same treatment checkout.update gives a payment it is handed. Completion is
+        // where money actually moves, so skipping verification here was the odder of
+        // the two. A no-op when no verifier is registered, and a no-op when the caller
+        // supplied no instruments -- an empty list is nothing to verify, not an
+        // instrument that fails verification.
+        foreach ($completeRequest->instruments as $instrument) {
+            foreach ($this->mandateVerifiers as $verifier) {
+                $verifier->verify($instrument, $request->context);
             }
 
-            // Fail closed: never complete a mandate no registered verifier could vouch for.
-            if (! $verified) {
-                throw new Ap2Exception('mandate_format_unsupported', 'No registered AP2 mandate verifier supports the supplied checkout mandate.');
-            }
+            $this->eventDispatcher->dispatch(new PaymentMandateVerificationEvent($instrument, $request->context));
         }
 
-        // Passing the verified snapshot lets the adapter refuse completion when the checkout
-        // terms changed between mandate verification and completion (TOCTOU).
-        $checkout = $this->finalizeCheckout(
-            $checkoutCapability->completeCheckout($completeRequest, $request->context, $currentCheckout),
-            $request,
-        );
+        // Capabilities that did not opt in are called exactly as before, so the
+        // spec-required payment reaches whoever can use it without obliging anyone to
+        // change. See PaymentAwareCheckoutCapabilityInterface.
+        $checkout = $capability instanceof PaymentAwareCheckoutCapabilityInterface
+            ? $capability->completeCheckoutFromRequest($completeRequest, $request->context)
+            : $capability->completeCheckout($id, $request->context);
 
-        return $this->response('checkout.complete', $checkout, UcpCapability::Checkout, $request->context);
+        return $this->response('checkout.complete', $this->finalizeCheckout($checkout, $request), UcpCapability::Checkout, $request->context);
     }
 
     private function checkoutCancel(ShoppingOperationRequest $request): UcpOperationResponse
@@ -397,23 +368,8 @@ final class ShoppingOperationExecutor
 
         $event = new CheckoutResponsePreparedEvent($checkout, $request->context);
         $this->eventDispatcher->dispatch($event);
-        $checkout = $event->getCheckout();
 
-        // Once AP2 is negotiated, every checkout response must carry the
-        // business's merchant authorization signature.
-        if ($this->checkoutMerchantAuthorizationSigner !== null && $this->ap2Negotiated($request->context)) {
-            $ap2 = is_array($checkout->extra['ap2'] ?? null) ? $checkout->extra['ap2'] : [];
-            $ap2['merchant_authorization'] = $this->checkoutMerchantAuthorizationSigner->sign($checkout->toArray(), $request->context);
-            $checkout = $checkout->withExtra(['ap2' => $ap2]);
-        }
-
-        return $checkout;
-    }
-
-    private function ap2Negotiated(RequestContext $context): bool
-    {
-        return $context->negotiation !== null
-            && array_key_exists(UcpCapability::Ap2Mandate->value, $context->negotiation->capabilities);
+        return $event->getCheckout();
     }
 
     private function requiredId(ShoppingOperationRequest $request): string

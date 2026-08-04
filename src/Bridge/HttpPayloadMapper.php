@@ -6,7 +6,6 @@ namespace Ucp\Sdk\Symfony\Bridge;
 
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
-use Ucp\Sdk\Model\Ap2\Ap2CheckoutData;
 use Ucp\Sdk\Model\Cart\CartCreateRequest;
 use Ucp\Sdk\Model\Cart\CartUpdateRequest;
 use Ucp\Sdk\Model\Catalog\CatalogLookupRequest;
@@ -19,10 +18,8 @@ use Ucp\Sdk\Model\Checkout\CheckoutUpdateRequest;
 use Ucp\Sdk\Model\Checkout\DiscountCode;
 use Ucp\Sdk\Model\Checkout\FulfillmentSelection;
 use Ucp\Sdk\Model\Checkout\PaymentInstrument;
-use Ucp\Sdk\Model\Checkout\PaymentSelection;
 use Ucp\Sdk\Model\Common\Buyer;
 use Ucp\Sdk\Model\Common\LineItem;
-use Ucp\Sdk\Model\Common\PostalAddress;
 use Ucp\Sdk\Model\Common\Signals;
 use Ucp\Sdk\Model\Identity\OAuthAuthorizationRequest;
 use Ucp\Sdk\Model\Identity\OAuthTokenRequest;
@@ -30,11 +27,6 @@ use Ucp\Sdk\Model\Identity\OAuthTokenRequest;
 /** @internal */
 final class HttpPayloadMapper
 {
-    /**
-     * SD-JWT+kb credential pattern for `ap2.checkout_mandate` per the AP2 mandates specification.
-     */
-    public const CHECKOUT_MANDATE_PATTERN = '/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(~[A-Za-z0-9_-]+)*$/';
-
     /**
      * @return array<string, mixed>
      */
@@ -156,51 +148,46 @@ final class HttpPayloadMapper
     {
         return new CheckoutCompleteRequest(
             $id,
-            isset($payload['payment']) && is_array($payload['payment'])
-                ? $this->toPaymentSelection($payload['payment'])
-                : null,
-            isset($payload['ap2']) && is_array($payload['ap2'])
-                ? new Ap2CheckoutData($this->toCheckoutMandate($payload['ap2']))
-                : null,
+            $this->toPaymentInstruments($payload['payment'] ?? null),
+            $this->toSignals($payload['signals'] ?? null),
         );
     }
 
     /**
-     * @param array<string, mixed> $payload
+     * Reads the instrument list out of a spec-shaped payment object.
+     *
+     * `payment.json` defines `{"instruments": [...]}`, so an empty list means the
+     * caller supplied no instrument -- which is different from supplying a broken one.
+     * Passing the payment object itself to toPaymentInstrument() would read a
+     * top-level `handler_id` that is not there and manufacture an instrument with an
+     * empty handler id, which a mandate verifier then rejects.
+     *
+     * The flat single-instrument shape is still accepted, because
+     * CheckoutUpdateRequest has always taken it and callers migrating between the two
+     * operations should not have to notice.
+     *
+     * @return list<PaymentInstrument>
      */
-    public function toPaymentSelection(array $payload): PaymentSelection
+    private function toPaymentInstruments(mixed $payload): array
     {
-        // Tolerate a bare instrument object (the shape checkout.update accepts)
-        // in place of the spec's nested `instruments` list.
-        $rows = is_array($payload['instruments'] ?? null)
-            ? $payload['instruments']
-            : (isset($payload['handler_id']) || isset($payload['credential']) ? [$payload] : []);
+        if (! is_array($payload)) {
+            return [];
+        }
 
-        $instruments = [];
-        foreach ($rows as $row) {
-            if (is_array($row)) {
-                $instruments[] = $this->toPaymentInstrument($row);
+        if (isset($payload['instruments'])) {
+            $instruments = [];
+            foreach (is_array($payload['instruments']) ? $payload['instruments'] : [] as $instrument) {
+                if (is_array($instrument)) {
+                    $instruments[] = $this->toPaymentInstrument($instrument);
+                }
             }
+
+            return $instruments;
         }
 
-        return new PaymentSelection($instruments);
-    }
-
-    /**
-     * @param array<string, mixed> $ap2
-     */
-    private function toCheckoutMandate(array $ap2): ?string
-    {
-        if (! array_key_exists('checkout_mandate', $ap2)) {
-            return null;
-        }
-
-        $mandate = $ap2['checkout_mandate'];
-        if (! is_string($mandate) || preg_match(self::CHECKOUT_MANDATE_PATTERN, $mandate) !== 1) {
-            throw new BadRequestHttpException('ap2.checkout_mandate must be an SD-JWT formatted string.');
-        }
-
-        return $mandate;
+        return isset($payload['handler_id']) || isset($payload['type'])
+            ? [$this->toPaymentInstrument($payload)]
+            : [];
     }
 
     /**
@@ -212,10 +199,6 @@ final class HttpPayloadMapper
             (string) ($payload['type'] ?? 'tokenized'),
             (string) ($payload['handler_id'] ?? ''),
             is_array($payload['credential'] ?? null) ? $payload['credential'] : [],
-            isset($payload['id']) && is_string($payload['id']) ? $payload['id'] : null,
-            isset($payload['selected']) ? (bool) $payload['selected'] : null,
-            is_array($payload['billing_address'] ?? null) ? PostalAddress::fromArray($payload['billing_address']) : null,
-            is_array($payload['display'] ?? null) ? $payload['display'] : null,
         );
     }
 

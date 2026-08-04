@@ -7,16 +7,15 @@ namespace Ucp\Sdk\Symfony\Tests\Unit;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\EventDispatcher\EventDispatcher;
-use Ucp\Sdk\Contract\Ap2CheckoutMandateVerifierInterface;
 use Ucp\Sdk\Contract\CapabilityInterface;
 use Ucp\Sdk\Contract\CartCapabilityInterface;
 use Ucp\Sdk\Contract\CatalogCapabilityInterface;
 use Ucp\Sdk\Contract\CheckoutCapabilityInterface;
 use Ucp\Sdk\Contract\DiscountCapabilityInterface;
 use Ucp\Sdk\Contract\OrderCapabilityInterface;
+use Ucp\Sdk\Contract\PaymentAwareCheckoutCapabilityInterface;
 use Ucp\Sdk\Contract\PaymentMandateVerifierInterface;
 use Ucp\Sdk\Enum\CheckoutStatus;
-use Ucp\Sdk\Exception\Ap2Exception;
 use Ucp\Sdk\Exception\NegotiationException;
 use Ucp\Sdk\Model\Cart\Cart;
 use Ucp\Sdk\Model\Cart\CartCreateRequest;
@@ -39,7 +38,6 @@ use Ucp\Sdk\Model\Profile\CapabilityDescriptor;
 use Ucp\Sdk\Model\Profile\PlatformProfile;
 use Ucp\Sdk\Model\RequestContext;
 use Ucp\Sdk\Service\CapabilityRegistryInterface;
-use Ucp\Sdk\Service\CheckoutMerchantAuthorizationSignerInterface;
 use Ucp\Sdk\Service\ProtocolValidatorInterface;
 use Ucp\Sdk\Symfony\Bridge\HttpPayloadMapper;
 use Ucp\Sdk\Symfony\Operation\ShoppingOperationExecutor;
@@ -47,8 +45,6 @@ use Ucp\Sdk\Symfony\Operation\ShoppingOperationRequest;
 
 final class ShoppingOperationExecutorValidationTest extends TestCase
 {
-    private const CHECKOUT_MANDATE = 'eyJhbGciOiJFUzI1NiJ9.eyJjaGVja291dCI6dHJ1ZX0.c2lnbmF0dXJl~ZGlzY2xvc3VyZQ';
-
     #[Test]
     public function itValidatesRequestsAndResponsesForEveryShoppingOperation(): void
     {
@@ -98,6 +94,217 @@ final class ShoppingOperationExecutorValidationTest extends TestCase
             'request:order.get',
             'response:order.get',
         ], $validator->calls);
+    }
+
+    #[Test]
+    public function itHandsTheCompletionPaymentToACapabilityThatOptedIn(): void
+    {
+        $capability = new ShoppingOperationPaymentAwareCapabilityFake();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake($capability),
+            new ShoppingOperationProtocolValidatorSpy(),
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [],
+            new EventDispatcher(),
+        );
+
+        $executor->execute(new ShoppingOperationRequest(
+            'checkout.complete',
+            ['payment' => ['instruments' => [['type' => 'invoice', 'handler_id' => 'com.example.invoice']]]],
+            new RequestContext('merchant.example'),
+            'checkout-1',
+        ));
+
+        self::assertFalse($capability->completedWithoutRequest, 'The opted-in method should be preferred.');
+        self::assertNotNull($capability->completeRequest);
+        self::assertSame('checkout-1', $capability->completeRequest->id);
+        self::assertSame('invoice', $capability->completeRequest->instruments[0]->type);
+        self::assertSame('com.example.invoice', $capability->completeRequest->instruments[0]->handlerId);
+    }
+
+    #[Test]
+    public function itReadsNoInstrumentsFromAnEmptySpecShapedPaymentObject(): void
+    {
+        $capability = new ShoppingOperationPaymentAwareCapabilityFake();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake($capability),
+            new ShoppingOperationProtocolValidatorSpy(),
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [],
+            new EventDispatcher(),
+        );
+
+        // `{"instruments": []}` satisfies the spec-required payment while naming no
+        // instrument. Reading a top-level handler_id here would invent one with an
+        // empty handler id and fail every mandate verifier.
+        $executor->execute(new ShoppingOperationRequest(
+            'checkout.complete',
+            ['payment' => ['instruments' => []]],
+            new RequestContext('merchant.example'),
+            'checkout-1',
+        ));
+
+        self::assertSame([], $capability->completeRequest?->instruments);
+    }
+
+    #[Test]
+    public function itStillAcceptsTheFlatSingleInstrumentShapeCheckoutUpdateUses(): void
+    {
+        $capability = new ShoppingOperationPaymentAwareCapabilityFake();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake($capability),
+            new ShoppingOperationProtocolValidatorSpy(),
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [],
+            new EventDispatcher(),
+        );
+
+        $executor->execute(new ShoppingOperationRequest(
+            'checkout.complete',
+            ['payment' => ['type' => 'invoice', 'handler_id' => 'com.example.invoice']],
+            new RequestContext('merchant.example'),
+            'checkout-1',
+        ));
+
+        self::assertSame('com.example.invoice', $capability->completeRequest?->instruments[0]->handlerId);
+    }
+
+    #[Test]
+    public function itStillCompletesThroughTheOriginalMethodForCapabilitiesThatDidNotOptIn(): void
+    {
+        $capability = new ShoppingOperationCapabilityFake();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake($capability),
+            new ShoppingOperationProtocolValidatorSpy(),
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [],
+            new EventDispatcher(),
+        );
+
+        // The payment is still validated and still unusable by this capability, but
+        // nothing it implements had to change for the request to succeed.
+        $executor->execute(new ShoppingOperationRequest(
+            'checkout.complete',
+            ['payment' => ['instruments' => [['type' => 'invoice', 'handler_id' => 'com.example.invoice']]]],
+            new RequestContext('merchant.example'),
+            'checkout-1',
+        ));
+
+        self::assertTrue($capability->completedWithoutRequest);
+    }
+
+    #[Test]
+    public function itVerifiesTheCompletionPaymentMandateTheWayCheckoutUpdateDoes(): void
+    {
+        $verifier = new ShoppingOperationMandateVerifierSpy();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake(new ShoppingOperationPaymentAwareCapabilityFake()),
+            new ShoppingOperationProtocolValidatorSpy(),
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [$verifier],
+            new EventDispatcher(),
+        );
+
+        $executor->execute(new ShoppingOperationRequest(
+            'checkout.complete',
+            ['payment' => ['instruments' => [['type' => 'invoice', 'handler_id' => 'com.example.invoice']]]],
+            new RequestContext('merchant.example'),
+            'checkout-1',
+        ));
+
+        self::assertSame(['com.example.invoice'], $verifier->verifiedHandlerIds);
+    }
+
+    #[Test]
+    public function itSkipsMandateVerificationWhenCompletionNamesNoInstrument(): void
+    {
+        $verifier = new ShoppingOperationMandateVerifierSpy();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake(new ShoppingOperationPaymentAwareCapabilityFake()),
+            new ShoppingOperationProtocolValidatorSpy(),
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [$verifier],
+            new EventDispatcher(),
+        );
+
+        $executor->execute(new ShoppingOperationRequest(
+            'checkout.complete',
+            ['payment' => ['instruments' => []]],
+            new RequestContext('merchant.example'),
+            'checkout-1',
+        ));
+
+        self::assertSame([], $verifier->verifiedHandlerIds);
+    }
+
+    #[Test]
+    public function itMergesTheResourceIdIntoTheCartUpdatePayloadBeforeValidating(): void
+    {
+        $validator = new ShoppingOperationProtocolValidatorSpy();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake(new ShoppingOperationCapabilityFake()),
+            $validator,
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [],
+            new EventDispatcher(),
+        );
+
+        // cart.update.request requires `id`, but on REST it arrives in the route and
+        // on MCP in a tool argument. Without the merge a caller had to repeat it in
+        // the body purely to satisfy the schema.
+        $executor->execute(new ShoppingOperationRequest(
+            'cart.update',
+            ['line_items' => []],
+            new RequestContext('merchant.example'),
+            'cart-1',
+        ));
+
+        self::assertSame(
+            ['id' => 'cart-1', 'line_items' => []],
+            $validator->requestPayloads['cart.update'],
+        );
+    }
+
+    #[Test]
+    public function itLetsAnIdAlreadyInTheCartUpdatePayloadWin(): void
+    {
+        $validator = new ShoppingOperationProtocolValidatorSpy();
+        $executor = new ShoppingOperationExecutor(
+            new ShoppingOperationCapabilityRegistryFake(new ShoppingOperationCapabilityFake()),
+            $validator,
+            new HttpPayloadMapper(),
+            [],
+            [],
+            [],
+            new EventDispatcher(),
+        );
+
+        // Callers that already repeat the id keep working unchanged.
+        $executor->execute(new ShoppingOperationRequest(
+            'cart.update',
+            ['id' => 'cart-1', 'line_items' => []],
+            new RequestContext('merchant.example'),
+            'cart-1',
+        ));
+
+        self::assertSame(
+            ['id' => 'cart-1', 'line_items' => []],
+            $validator->requestPayloads['cart.update'],
+        );
     }
 
     #[Test]
@@ -244,317 +451,6 @@ final class ShoppingOperationExecutorValidationTest extends TestCase
         ], $validator->calls);
     }
 
-    #[Test]
-    public function checkoutCompletePassesParsedPaymentAndAp2Request(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-            [new RecordingAp2CheckoutMandateVerifier($capability)],
-        );
-
-        $executor->execute(new ShoppingOperationRequest(
-            'checkout.complete',
-            [
-                'payment' => ['instruments' => [[
-                    'type' => 'tokenized',
-                    'handler_id' => 'com.example.psp',
-                    'credential' => ['token' => 'payment_mandate'],
-                ]]],
-                'ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE],
-            ],
-            $this->ap2NegotiatedContext(),
-            'checkout-1',
-        ));
-
-        $completedRequest = $capability->completedRequest;
-        self::assertNotNull($completedRequest);
-        self::assertSame('checkout-1', $completedRequest->id);
-        self::assertSame(self::CHECKOUT_MANDATE, $completedRequest->ap2?->checkoutMandate);
-        self::assertSame('com.example.psp', $completedRequest->payment?->instruments[0]->handlerId);
-    }
-
-    #[Test]
-    public function checkoutCompleteInvokesAp2VerifierBeforeAdapterCompletion(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $verifier = new RecordingAp2CheckoutMandateVerifier($capability);
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-            [$verifier],
-        );
-
-        $executor->execute(new ShoppingOperationRequest(
-            'checkout.complete',
-            ['ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE]],
-            $this->ap2NegotiatedContext(),
-            'checkout-1',
-        ));
-
-        self::assertSame('checkout-1', $verifier->request?->id);
-        self::assertSame('checkout-1', $verifier->currentCheckout?->id);
-        self::assertTrue($verifier->calledBeforeAdapterCompletion);
-        self::assertSame($verifier->currentCheckout, $capability->completedVerifiedCheckout);
-    }
-
-    #[Test]
-    public function checkoutCompleteRunsPaymentMandateVerifiersOnSubmittedInstruments(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $verifier = new RecordingPaymentMandateVerifier($capability);
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [$verifier],
-            new EventDispatcher(),
-        );
-
-        $executor->execute(new ShoppingOperationRequest(
-            'checkout.complete',
-            [
-                'payment' => ['instruments' => [[
-                    'type' => 'tokenized',
-                    'handler_id' => 'com.example.psp',
-                    'credential' => ['token' => 'payment_mandate'],
-                ]]],
-            ],
-            new RequestContext('merchant.example'),
-            'checkout-1',
-        ));
-
-        self::assertSame('com.example.psp', $verifier->instrument?->handlerId);
-        self::assertTrue($verifier->calledBeforeAdapterCompletion);
-    }
-
-    #[Test]
-    public function checkoutCompleteEmbedsMerchantAuthorizationForAp2Requests(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $signer = new RecordingCheckoutMerchantAuthorizationSigner();
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-            [new RecordingAp2CheckoutMandateVerifier($capability)],
-            $signer,
-        );
-
-        $response = $executor->execute(new ShoppingOperationRequest(
-            'checkout.complete',
-            ['ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE]],
-            $this->ap2NegotiatedContext(),
-            'checkout-1',
-        ));
-
-        self::assertSame('checkout-1', $signer->signedPayload['id'] ?? null);
-        self::assertArrayNotHasKey('ap2', $signer->signedPayload ?? []);
-        $ap2 = $response->toArray()['ap2'] ?? null;
-        self::assertIsArray($ap2);
-        self::assertSame('signed-jws', $ap2['merchant_authorization'] ?? null);
-    }
-
-    #[Test]
-    public function checkoutCompleteDoesNotSignResponsesWithoutAp2Data(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $signer = new RecordingCheckoutMerchantAuthorizationSigner();
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-            [],
-            $signer,
-        );
-
-        $response = $executor->execute(new ShoppingOperationRequest(
-            'checkout.complete',
-            ['payment' => ['instruments' => []]],
-            new RequestContext('merchant.example'),
-            'checkout-1',
-        ));
-
-        self::assertNull($signer->signedPayload);
-        self::assertArrayNotHasKey('ap2', $response->toArray());
-    }
-
-    #[Test]
-    public function checkoutCompleteRejectsAp2MemberWhenNotNegotiated(): void
-    {
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake(new ShoppingOperationCapabilityFake()),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-        );
-
-        try {
-            $executor->execute(new ShoppingOperationRequest(
-                'checkout.complete',
-                ['ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE]],
-                new RequestContext('merchant.example'),
-                'checkout-1',
-            ));
-            self::fail('Expected an ap2_not_negotiated rejection.');
-        } catch (Ap2Exception $exception) {
-            self::assertSame('ap2_not_negotiated', $exception->errorCode);
-        }
-    }
-
-    #[Test]
-    public function checkoutCompleteRejectsMandatelessRequestsWhenAp2WasNegotiated(): void
-    {
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake(new ShoppingOperationCapabilityFake()),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-        );
-
-        try {
-            $executor->execute(new ShoppingOperationRequest(
-                'checkout.complete',
-                ['payment' => ['instruments' => []]],
-                $this->ap2NegotiatedContext(),
-                'checkout-1',
-            ));
-            self::fail('Expected a mandate_required rejection.');
-        } catch (Ap2Exception $exception) {
-            self::assertSame('mandate_required', $exception->errorCode);
-        }
-    }
-
-    #[Test]
-    public function checkoutCompleteFailsClosedWhenNoVerifierSupportsTheMandate(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $verifier = new RecordingAp2CheckoutMandateVerifier($capability, supports: false);
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-            [$verifier],
-        );
-
-        try {
-            $executor->execute(new ShoppingOperationRequest(
-                'checkout.complete',
-                ['ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE]],
-                $this->ap2NegotiatedContext(),
-                'checkout-1',
-            ));
-            self::fail('Expected a mandate_format_unsupported rejection.');
-        } catch (Ap2Exception $exception) {
-            self::assertSame('mandate_format_unsupported', $exception->errorCode);
-        }
-
-        self::assertFalse($verifier->verifyCalled);
-        self::assertNull($capability->completedRequest);
-    }
-
-    #[Test]
-    public function checkoutCompleteFailsClosedWhenNoVerifierIsRegistered(): void
-    {
-        $capability = new ShoppingOperationCapabilityFake();
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-        );
-
-        try {
-            $executor->execute(new ShoppingOperationRequest(
-                'checkout.complete',
-                ['ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE]],
-                $this->ap2NegotiatedContext(),
-                'checkout-1',
-            ));
-            self::fail('Expected a mandate_format_unsupported rejection.');
-        } catch (Ap2Exception $exception) {
-            self::assertSame('mandate_format_unsupported', $exception->errorCode);
-        }
-
-        self::assertNull($capability->completedRequest);
-    }
-
-    #[Test]
-    public function checkoutResponsesCarryMerchantAuthorizationWhenAp2WasNegotiated(): void
-    {
-        $signer = new RecordingCheckoutMerchantAuthorizationSigner();
-        $capability = new ShoppingOperationCapabilityFake();
-        $executor = new ShoppingOperationExecutor(
-            new ShoppingOperationCapabilityRegistryFake($capability),
-            new ShoppingOperationProtocolValidatorSpy(),
-            new HttpPayloadMapper(),
-            [],
-            [],
-            [],
-            new EventDispatcher(),
-            [new RecordingAp2CheckoutMandateVerifier($capability)],
-            $signer,
-        );
-        $context = $this->ap2NegotiatedContext();
-
-        $requests = [
-            new ShoppingOperationRequest('checkout.create', ['line_items' => []], $context),
-            new ShoppingOperationRequest('checkout.get', [], $context, 'checkout-1'),
-            new ShoppingOperationRequest('checkout.update', ['line_items' => []], $context, 'checkout-1'),
-            new ShoppingOperationRequest('checkout.complete', ['ap2' => ['checkout_mandate' => self::CHECKOUT_MANDATE]], $context, 'checkout-1'),
-            new ShoppingOperationRequest('checkout.cancel', [], $context, 'checkout-1'),
-        ];
-
-        foreach ($requests as $request) {
-            $ap2 = $executor->execute($request)->toArray()['ap2'] ?? null;
-            self::assertIsArray($ap2, $request->operation);
-            self::assertSame('signed-jws', $ap2['merchant_authorization'] ?? null, $request->operation);
-        }
-    }
-
-    private function ap2NegotiatedContext(): RequestContext
-    {
-        return new RequestContext('merchant.example', negotiation: new NegotiatedCapabilities([
-            'dev.ucp.shopping.ap2_mandate' => [
-                new CapabilityDescriptor('dev.ucp.shopping.ap2_mandate', '2026-04-08', 'spec', 'schema'),
-            ],
-        ]));
-    }
-
     /**
      * @return list<ShoppingOperationRequest>
      */
@@ -579,74 +475,18 @@ final class ShoppingOperationExecutorValidationTest extends TestCase
     }
 }
 
-final class RecordingPaymentMandateVerifier implements PaymentMandateVerifierInterface
-{
-    public ?PaymentInstrument $instrument = null;
-
-    public bool $calledBeforeAdapterCompletion = false;
-
-    public function __construct(private readonly ShoppingOperationCapabilityFake $capability)
-    {
-    }
-
-    public function verify(PaymentInstrument $instrument, RequestContext $context): void
-    {
-        $this->instrument = $instrument;
-        $this->calledBeforeAdapterCompletion = $this->capability->completedRequest === null;
-    }
-}
-
-final class RecordingCheckoutMerchantAuthorizationSigner implements CheckoutMerchantAuthorizationSignerInterface
-{
-    /** @var array<string, mixed>|null */
-    public ?array $signedPayload = null;
-
-    public function sign(array $checkoutPayload, RequestContext $context): string
-    {
-        $this->signedPayload = $checkoutPayload;
-
-        return 'signed-jws';
-    }
-}
-
-final class RecordingAp2CheckoutMandateVerifier implements Ap2CheckoutMandateVerifierInterface
-{
-    public ?CheckoutCompleteRequest $request = null;
-
-    public ?Checkout $currentCheckout = null;
-
-    public bool $calledBeforeAdapterCompletion = false;
-
-    public bool $verifyCalled = false;
-
-    public function __construct(
-        private readonly ShoppingOperationCapabilityFake $capability,
-        private readonly bool $supports = true,
-    ) {
-    }
-
-    public function supports(CheckoutCompleteRequest $request, Checkout $currentCheckout, RequestContext $context): bool
-    {
-        return $this->supports;
-    }
-
-    public function verify(CheckoutCompleteRequest $request, Checkout $currentCheckout, RequestContext $context): void
-    {
-        $this->request = $request;
-        $this->currentCheckout = $currentCheckout;
-        $this->verifyCalled = true;
-        $this->calledBeforeAdapterCompletion = $this->capability->completedRequest === null;
-    }
-}
-
 final class ShoppingOperationProtocolValidatorSpy implements ProtocolValidatorInterface
 {
     /** @var list<string> */
     public array $calls = [];
 
+    /** @var array<string, array<string, mixed>> */
+    public array $requestPayloads = [];
+
     public function validateRequest(string $operation, array $payload, RequestContext $context): void
     {
         $this->calls[] = 'request:' . $operation;
+        $this->requestPayloads[$operation] = $payload;
     }
 
     public function validateResponse(string $operation, array $payload, RequestContext $context): void
@@ -677,13 +517,9 @@ final class ShoppingOperationCapabilityRegistryFake implements CapabilityRegistr
     }
 }
 
-final class ShoppingOperationCapabilityFake implements CatalogCapabilityInterface, CartCapabilityInterface, DiscountCapabilityInterface, CheckoutCapabilityInterface, OrderCapabilityInterface
+class ShoppingOperationCapabilityFake implements CatalogCapabilityInterface, CartCapabilityInterface, DiscountCapabilityInterface, CheckoutCapabilityInterface, OrderCapabilityInterface
 {
     public ?CatalogProductRequest $productRequest = null;
-
-    public ?CheckoutCompleteRequest $completedRequest = null;
-
-    public ?Checkout $completedVerifiedCheckout = null;
 
     public function describe(): CapabilityDescriptor
     {
@@ -747,12 +583,13 @@ final class ShoppingOperationCapabilityFake implements CatalogCapabilityInterfac
         return $this->checkout($request->id);
     }
 
-    public function completeCheckout(CheckoutCompleteRequest $request, RequestContext $context, ?Checkout $verifiedCheckout = null): Checkout
-    {
-        $this->completedRequest = $request;
-        $this->completedVerifiedCheckout = $verifiedCheckout;
+    public bool $completedWithoutRequest = false;
 
-        return $this->checkout($request->id, CheckoutStatus::Completed);
+    public function completeCheckout(string $id, RequestContext $context): Checkout
+    {
+        $this->completedWithoutRequest = true;
+
+        return $this->checkout($id, CheckoutStatus::Completed);
     }
 
     public function cancelCheckout(string $id, RequestContext $context): Checkout
@@ -781,5 +618,34 @@ final class ShoppingOperationCapabilityFake implements CatalogCapabilityInterfac
     private function checkout(string $id, CheckoutStatus $status = CheckoutStatus::Incomplete): Checkout
     {
         return new Checkout($id, $status, 'EUR', [], []);
+    }
+}
+
+/**
+ * A capability that opted into PaymentAwareCheckoutCapabilityInterface.
+ *
+ * Extending the plain fake shows the opt-in for what it is: one extra method, with
+ * nothing existing rewritten.
+ */
+final class ShoppingOperationPaymentAwareCapabilityFake extends ShoppingOperationCapabilityFake implements PaymentAwareCheckoutCapabilityInterface
+{
+    public ?CheckoutCompleteRequest $completeRequest = null;
+
+    public function completeCheckoutFromRequest(CheckoutCompleteRequest $request, RequestContext $context): Checkout
+    {
+        $this->completeRequest = $request;
+
+        return new Checkout($request->id, CheckoutStatus::Completed, 'EUR', [], []);
+    }
+}
+
+final class ShoppingOperationMandateVerifierSpy implements PaymentMandateVerifierInterface
+{
+    /** @var list<string> */
+    public array $verifiedHandlerIds = [];
+
+    public function verify(PaymentInstrument $instrument, RequestContext $context): void
+    {
+        $this->verifiedHandlerIds[] = $instrument->handlerId;
     }
 }
