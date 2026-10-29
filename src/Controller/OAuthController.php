@@ -6,6 +6,7 @@ namespace Ucp\Sdk\Symfony\Controller;
 
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\Routing\Attribute\Route;
 use Ucp\Sdk\Contract\CapabilityInterface;
 use Ucp\Sdk\Contract\IdentityLinkingCapabilityInterface;
@@ -16,6 +17,7 @@ use Ucp\Sdk\Service\CapabilityRegistryInterface;
 use Ucp\Sdk\Service\RuntimeConfigurationResolverInterface;
 use Ucp\Sdk\Symfony\Bridge\HttpPayloadMapper;
 use Ucp\Sdk\Symfony\Bridge\UcpResponseFactory;
+use Ucp\Sdk\Symfony\Internal\TargetUri;
 
 /** @internal */
 final class OAuthController
@@ -33,7 +35,16 @@ final class OAuthController
     {
         $context = $this->publicContext($request);
 
-        return $this->responseFactory->success($this->requireCapability($context)->getMetadata($context)->toArray(), context: $context, operation: 'oauth.metadata');
+        // The root well-known path is shared with every other OAuth server on the host, and
+        // clients probing RFC 8414 candidates move on only after a 404. A 501 here would stop
+        // their discovery for a server this merchant does not run.
+        try {
+            $capability = $this->requireCapability($context);
+        } catch (UnsupportedCapabilityException $exception) {
+            throw new NotFoundHttpException('OAuth authorization server metadata is not available.', $exception);
+        }
+
+        return $this->responseFactory->success($capability->getMetadata($context)->toArray(), context: $context, operation: 'oauth.metadata');
     }
 
     #[Route(path: '/ucp/v1/oauth/authorize', methods: ['GET'])]
@@ -79,7 +90,7 @@ final class OAuthController
 
         $httpRequest = new HttpRequest(
             $request->getMethod(),
-            $request->getUri(),
+            TargetUri::of($request),
             $headers,
             array_map(static fn (mixed $value): string => is_scalar($value) ? (string) $value : json_encode($value, JSON_THROW_ON_ERROR), $query),
             '',
